@@ -16,7 +16,10 @@ from .contract_line_constraints import get_allowed
 class ContractLine(models.Model):
     _name = "contract.line"
     _description = "Contract Line"
-    _inherit = "contract.abstract.contract.line"
+    _inherit = [
+        "contract.abstract.contract.line",
+        "contract.recurrency.mixin",
+    ]
     _order = "sequence,id"
 
     sequence = fields.Integer(string="Sequence",)
@@ -34,22 +37,8 @@ class ContractLine(models.Model):
     analytic_tag_ids = fields.Many2many(
         comodel_name="account.analytic.tag", string="Analytic Tags",
     )
-    date_start = fields.Date(
-        string="Date Start",
-        required=True,
-        default=lambda self: fields.Date.context_today(self),
-    )
-    date_end = fields.Date(string="Date End", index=True)
-    recurring_next_date = fields.Date(string="Date of Next Invoice")
-    last_date_invoiced = fields.Date(
-        string="Last Date Invoiced", readonly=True, copy=False
-    )
-    next_period_date_start = fields.Date(
-        string="Next Period Start", compute="_compute_next_period_date_start",
-    )
-    next_period_date_end = fields.Date(
-        string="Next Period End", compute="_compute_next_period_date_end",
-    )
+    date_start = fields.Date(required=True)
+    date_end = fields.Date(compute="_compute_date_end", store=True, readonly=False)
     termination_notice_date = fields.Date(
         string="Termination notice date",
         compute="_compute_termination_notice_date",
@@ -118,6 +107,10 @@ class ContractLine(models.Model):
         readonly=True,
         default=True,
     )
+
+    @api.depends("contract_id.date_end", "contract_id.line_recurrence")
+    def _compute_date_end(self):
+        self._set_recurrence_field("date_end")
 
     @api.depends(
         "date_end", "termination_notice_rule_type", "termination_notice_interval",
@@ -390,115 +383,6 @@ class ContractLine(models.Model):
         )
 
     @api.model
-    def get_next_invoice_date(
-        self,
-        next_period_date_start,
-        recurring_invoicing_type,
-        recurring_invoicing_offset,
-        recurring_rule_type,
-        recurring_interval,
-        max_date_end,
-    ):
-        next_period_date_end = self.get_next_period_date_end(
-            next_period_date_start,
-            recurring_rule_type,
-            recurring_interval,
-            max_date_end=max_date_end,
-        )
-        if not next_period_date_end:
-            return False
-        if recurring_invoicing_type == "pre-paid":
-            recurring_next_date = next_period_date_start + relativedelta(
-                days=recurring_invoicing_offset
-            )
-        else:  # post-paid
-            recurring_next_date = next_period_date_end + relativedelta(
-                days=recurring_invoicing_offset
-            )
-        return recurring_next_date
-
-    @api.model
-    def get_next_period_date_end(
-        self,
-        next_period_date_start,
-        recurring_rule_type,
-        recurring_interval,
-        max_date_end,
-        next_invoice_date=False,
-        recurring_invoicing_type=False,
-        recurring_invoicing_offset=False,
-    ):
-        """Compute the end date for the next period.
-
-        The next period normally depends on recurrence options only.
-        It is however possible to provide it a next invoice date, in
-        which case this method can adjust the next period based on that
-        too. In that scenario it required the invoicing type and offset
-        arguments.
-        """
-        if not next_period_date_start:
-            return False
-        if max_date_end and next_period_date_start > max_date_end:
-            # start is past max date end: there is no next period
-            return False
-        if not next_invoice_date:
-            # regular algorithm
-            next_period_date_end = (
-                next_period_date_start
-                + self.get_relative_delta(recurring_rule_type, recurring_interval)
-                - relativedelta(days=1)
-            )
-        else:
-            # special algorithm when the next invoice date is forced
-            if recurring_invoicing_type == "pre-paid":
-                next_period_date_end = (
-                    next_invoice_date
-                    - relativedelta(days=recurring_invoicing_offset)
-                    + self.get_relative_delta(recurring_rule_type, recurring_interval)
-                    - relativedelta(days=1)
-                )
-            else:  # post-paid
-                next_period_date_end = next_invoice_date - relativedelta(
-                    days=recurring_invoicing_offset
-                )
-        if max_date_end and next_period_date_end > max_date_end:
-            # end date is past max_date_end: trim it
-            next_period_date_end = max_date_end
-        return next_period_date_end
-
-    @api.depends("last_date_invoiced", "date_start", "date_end")
-    def _compute_next_period_date_start(self):
-        for rec in self:
-            if rec.last_date_invoiced:
-                next_period_date_start = rec.last_date_invoiced + relativedelta(days=1)
-            else:
-                next_period_date_start = rec.date_start
-            if rec.date_end and next_period_date_start > rec.date_end:
-                next_period_date_start = False
-            rec.next_period_date_start = next_period_date_start
-
-    @api.depends(
-        "next_period_date_start",
-        "recurring_invoicing_type",
-        "recurring_invoicing_offset",
-        "recurring_rule_type",
-        "recurring_interval",
-        "date_end",
-        "recurring_next_date",
-    )
-    def _compute_next_period_date_end(self):
-        for rec in self:
-            rec.next_period_date_end = self.get_next_period_date_end(
-                rec.next_period_date_start,
-                rec.recurring_rule_type,
-                rec.recurring_interval,
-                max_date_end=rec.date_end,
-                next_invoice_date=rec.recurring_next_date,
-                recurring_invoicing_type=rec.recurring_invoicing_type,
-                recurring_invoicing_offset=rec.recurring_invoicing_offset,
-            )
-
-    @api.model
     def _get_first_date_end(
         self, date_start, auto_renew_rule_type, auto_renew_interval
     ):
@@ -519,24 +403,6 @@ class ContractLine(models.Model):
                 rec.date_end = self._get_first_date_end(
                     rec.date_start, rec.auto_renew_rule_type, rec.auto_renew_interval,
                 )
-
-    @api.onchange(
-        "date_start",
-        "date_end",
-        "recurring_invoicing_type",
-        "recurring_rule_type",
-        "recurring_interval",
-    )
-    def _onchange_date_start(self):
-        for rec in self.filtered("date_start"):
-            rec.recurring_next_date = self.get_next_invoice_date(
-                rec.next_period_date_start,
-                rec.recurring_invoicing_type,
-                rec.recurring_invoicing_offset,
-                rec.recurring_rule_type,
-                rec.recurring_interval,
-                max_date_end=rec.date_end,
-            )
 
     @api.constrains("is_canceled", "is_auto_renew")
     def _check_auto_renew_canceled_lines(self):
@@ -718,51 +584,6 @@ class ContractLine(models.Model):
                     "last_date_invoiced": last_date_invoiced,
                 }
             )
-
-    def _init_last_date_invoiced(self):
-        """Used to init last_date_invoiced for migration purpose"""
-        for rec in self:
-            last_date_invoiced = rec.recurring_next_date - relativedelta(days=1)
-            if rec.recurring_rule_type == "monthlylastday":
-                last_date_invoiced = (
-                    rec.recurring_next_date
-                    - self.get_relative_delta(
-                        rec.recurring_rule_type, rec.recurring_interval - 1
-                    )
-                    - relativedelta(days=1)
-                )
-            elif rec.recurring_invoicing_type == "post-paid":
-                last_date_invoiced = (
-                    rec.recurring_next_date
-                    - self.get_relative_delta(
-                        rec.recurring_rule_type, rec.recurring_interval
-                    )
-                    - relativedelta(days=1)
-                )
-            if last_date_invoiced > rec.date_start:
-                rec.last_date_invoiced = last_date_invoiced
-
-    @api.model
-    def get_relative_delta(self, recurring_rule_type, interval):
-        """Return a relativedelta for one period.
-
-        When added to the first day of the period,
-        it gives the first day of the next period.
-        """
-        if recurring_rule_type == "daily":
-            return relativedelta(days=interval)
-        elif recurring_rule_type == "weekly":
-            return relativedelta(weeks=interval)
-        elif recurring_rule_type == "monthly":
-            return relativedelta(months=interval)
-        elif recurring_rule_type == "monthlylastday":
-            return relativedelta(months=interval, day=1)
-        elif recurring_rule_type == "quarterly":
-            return relativedelta(months=3 * interval)
-        elif recurring_rule_type == "semesterly":
-            return relativedelta(months=6 * interval)
-        else:
-            return relativedelta(years=interval)
 
     def _delay(self, delay_delta):
         """
@@ -1145,7 +966,6 @@ class ContractLine(models.Model):
         new_line = self.plan_successor(
             date_start, date_end, is_auto_renew, post_message=False
         )
-        new_line._onchange_date_start()
         return new_line
 
     def _renew_extend_line(self, date_end):
